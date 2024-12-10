@@ -180,12 +180,18 @@ async def websocket_endpoint(websocket: WebSocket):
                         continue
 
                     # Parse timestamps; fallback to current time if not provided
-                    time_rasp_pi_received_from_server = parse(
-                        rasp_pi_data.get('time_received', datetime.now().isoformat())
-                    ).astimezone(ET)
-                    time_rasp_pi_sent_to_server = parse(
-                        rasp_pi_data.get('time_processed', datetime.now().isoformat())
-                    ).astimezone(ET)
+                    try:
+                        time_rasp_pi_received_from_server = parse(
+                            rasp_pi_data.get('time_received', datetime.now().isoformat())
+                        ).astimezone(ET)
+                    except Exception:
+                        time_rasp_pi_received_from_server = datetime.now(ET)
+                    try:
+                        time_rasp_pi_sent_to_server = parse(
+                            rasp_pi_data.get('time_processed', datetime.now().isoformat())
+                        ).astimezone(ET)
+                    except Exception:
+                        time_rasp_pi_sent_to_server = datetime.now(ET)
                     pi_processing_latency = rasp_pi_data.get('total_time', 0)
 
                     server_to_pi_latency = (time_rasp_pi_received_from_server - time_server_sent_to_rasp_pi).total_seconds()
@@ -290,6 +296,20 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected.")
 
+def update_history(history, partner_prompt, user_response, model_responses, full_history, emotion, server_to_pi_latency, pi_processing_latency, pi_to_server_latency, api_latency):
+    history_snapshot = history[-3:]
+    while len(history) > 3:
+        history.pop(0)
+    history.append((partner_prompt, user_response, server_to_pi_latency, pi_processing_latency, pi_to_server_latency, api_latency))
+    if model_responses is not None:
+        full_history.append((partner_prompt, model_responses, user_response, history_snapshot, emotion))
+
+def update_full_history(full_history, last_convo_pair, chosen_response):
+    for index, (partner_prompt, model_responses, user_response, history_snapshot, emotion) in enumerate(full_history):
+        if partner_prompt == last_convo_pair[0] and user_response is None:
+            full_history[index] = (partner_prompt, model_responses, chosen_response, history_snapshot, emotion)
+            break
+
 @app.get("/download_csv")
 async def download_csv():
     global csv_file_path
@@ -308,6 +328,8 @@ async def download_csv():
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the Main Server. Use appropriate endpoints to interact."}
+
+# ------------------------ Run the Server ------------------------
 
 if __name__ =="__main__":
     uvicorn.run(app, host="0.0.0.0", port=5678, log_level="info")

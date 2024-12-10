@@ -1,16 +1,17 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import FileResponse
 import json
 import logging
 import uvicorn
 import csv
-from concurrent.futures import ThreadPoolExecutor
-import requests
+import httpx
 import asyncio
 from datetime import datetime
 from dateutil.parser import parse
 import os
 import pytz
+
+from fastapi.middleware.cors import CORSMiddleware
 
 # Set up basic configuration for logging
 logging.basicConfig(
@@ -23,9 +24,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from fastapi.middleware.cors import CORSMiddleware
-
 app = FastAPI(title="Main Server", version="1.1")
+
+# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Update with specific origins in production
@@ -34,9 +35,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-executor = ThreadPoolExecutor(max_workers=10)
+# Asynchronous HTTP client
+client = httpx.AsyncClient()
 
-# Updated API URL to point to the new LightRAG API
+# Updated API URL to point to the LightRAG API
 api_url = "http://localhost:7000/generate_response_informed"
 rasp_pi_api_url = "https://humane-marmot-entirely.ngrok-free.app/"
 headers = {"Content-Type": "application/json"}
@@ -60,27 +62,6 @@ def generate_csv_filename():
     timestamp = datetime.now(ET).strftime("%Y%m%d_%H%M%S")
     return os.path.join(session_csv_dir, f"conversation_history_{timestamp}.csv")
 
-def get_speech_to_text():
-    try:
-        response = requests.get(f'{rasp_pi_api_url}/get_audio_transcription', timeout=10)
-        response.raise_for_status()
-        data_json = response.json()
-        return data_json
-    except requests.RequestException as e:
-        logger.error(f"Error fetching speech-to-text: {e}")
-        return {}
-
-def check_last_entry(history):
-    if history and history[-1][1] is None:
-        logger.warning("Incomplete entry found in conversation history.")
-        return handle_incomplete_entry(history)
-    return None
-
-def handle_incomplete_entry(history):
-    incomplete_entry = history.pop()
-    logger.info(f"Removed incomplete entry: {incomplete_entry[0]}")
-    return f"Didn't choose a response; removed: {incomplete_entry[0]}"
-
 def initialize_csv_file(path):
     try:
         with open(path, 'w', newline='', encoding='utf-8') as file:
@@ -103,6 +84,64 @@ def append_to_csv_file(path, entry):
         logger.info(f"Appended entry to CSV at {path}")
     except Exception as e:
         logger.error(f"Failed to append to CSV: {e}")
+
+async def get_speech_to_text():
+    try:
+        response = await client.get(f'{rasp_pi_api_url}/get_audio_transcription', timeout=10)
+        response.raise_for_status()
+        data_json = response.json()
+        return data_json
+    except httpx.RequestError as e:
+        logger.error(f"Error fetching speech-to-text: {e}")
+        return {}
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error while fetching speech-to-text: {e}")
+        return {}
+
+async def send_to_api_async(prompt, number_of_responses, response_types, search_mode):
+    try:
+        payload = {
+            'prompt': prompt,
+            'number_of_responses': number_of_responses,
+            'response_types': response_types,
+            'search_mode': search_mode
+        }
+        logger.info(f"Sending payload to API: {payload}")
+        response = await client.post(api_url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        logger.info(f"Received response from API: {response.json()}")
+        return response.json()
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error occurred: {e.response.status_code} - {e.response.text}")
+        return {"responses": []}
+    except httpx.RequestError as e:
+        logger.error(f"Error sending request to API: {e}")
+        return {"responses": []}
+
+def check_last_entry(history):
+    if history and history[-1][1] is None:
+        logger.warning("Incomplete entry found in conversation history.")
+        return handle_incomplete_entry(history)
+    return None
+
+def handle_incomplete_entry(history):
+    incomplete_entry = history.pop()
+    logger.info(f"Removed incomplete entry: {incomplete_entry[0]}")
+    return f"Didn't choose a response; removed: {incomplete_entry[0]}"
+
+def update_history(history, partner_prompt, user_response, model_responses, full_history, emotion, server_to_pi_latency, pi_processing_latency, pi_to_server_latency, api_latency):
+    history_snapshot = history[-3:]
+    while len(history) > 3:
+        history.pop(0)
+    history.append((partner_prompt, user_response, server_to_pi_latency, pi_processing_latency, pi_to_server_latency, api_latency))
+    if model_responses is not None:
+        full_history.append((partner_prompt, model_responses, user_response, history_snapshot, emotion))
+
+def update_full_history(full_history, last_convo_pair, chosen_response):
+    for index, (partner_prompt, model_responses, user_response, history_snapshot, emotion) in enumerate(full_history):
+        if partner_prompt == last_convo_pair[0] and user_response is None:
+            full_history[index] = (partner_prompt, model_responses, chosen_response, history_snapshot, emotion)
+            break
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -131,7 +170,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     incomplete_message = check_last_entry(conversation_history)
                     
                     time_server_sent_to_rasp_pi = datetime.now(ET)
-                    rasp_pi_data = get_speech_to_text()
+                    rasp_pi_data = await get_speech_to_text()
                     time_server_received_from_rasp_pi = datetime.now(ET)
                     
                     prompt = rasp_pi_data.get('text', '')
@@ -161,26 +200,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     if prompt:
                         logger.info(f"Sending prompt to API with Emotion: {emotion}")
-                        loop = asyncio.get_running_loop()
-
-                        # Prepare parameters for the API
-                        number_of_responses = 2  # Example: 2 responses
-                        response_types = ["positive", "negative"]  # Example types
-                        search_mode = "hybrid"  # Example search mode
-
-                        # Optionally, retrieve these parameters from data_json if provided
-                        # number_of_responses = data_json.get("number_of_responses", 2)
-                        # response_types = data_json.get("response_types", ["positive", "negative"])
-                        # search_mode = data_json.get("search_mode", "hybrid")
-
                         api_request_start_time = datetime.now(ET)
-                        response = await loop.run_in_executor(
-                            executor, 
-                            send_to_api_sync, 
+                        response = await send_to_api_async(
                             prompt, 
-                            number_of_responses, 
-                            response_types, 
-                            search_mode
+                            number_of_responses=2,  # Example: 2 responses
+                            response_types=["positive", "negative"],  # Example types
+                            search_mode="hybrid"  # Example search mode
                         )
                         api_request_end_time = datetime.now(ET)
 
@@ -234,7 +259,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 len(conversation_history),
                                 timestamp,
                                 conversation_history[-1][0],
-                                full_conversation_history[-1][1],
+                                json.dumps(full_conversation_history[-1][1], ensure_ascii=False),
                                 chosen_response,
                                 full_conversation_history[-1][4],
                                 conversation_history[-1][2],  # server_to_pi_latency
@@ -265,20 +290,6 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected.")
 
-def update_history(history, partner_prompt, user_response, model_responses, full_history, emotion, server_to_pi_latency, pi_processing_latency, pi_to_server_latency, api_latency):
-    history_snapshot = history[-3:]
-    while len(history) > 3:
-        history.pop(0)
-    history.append((partner_prompt, user_response, server_to_pi_latency, pi_processing_latency, pi_to_server_latency, api_latency))
-    if model_responses is not None:
-        full_history.append((partner_prompt, model_responses, user_response, history_snapshot, emotion))
-
-def update_full_history(full_history, last_convo_pair, chosen_response):
-    for index, (partner_prompt, model_responses, user_response, history_snapshot, emotion) in enumerate(full_history):
-        if partner_prompt == last_convo_pair[0] and user_response is None:
-            full_history[index] = (partner_prompt, model_responses, chosen_response, history_snapshot, emotion)
-            break
-
 @app.get("/download_csv")
 async def download_csv():
     global csv_file_path
@@ -287,30 +298,16 @@ async def download_csv():
             return FileResponse(csv_file_path, media_type='text/csv', filename=os.path.basename(csv_file_path))
         else:
             logger.error("CSV file does not exist.")
-            return {"error": "CSV file does not exist."}
+            raise HTTPException(status_code=404, detail="CSV file does not exist.")
     except Exception as e:
         logger.error(f"Failed to generate CSV: {e}")
-        return {"error": f"Failed to generate CSV: {e}"}
+        raise HTTPException(status_code=500, detail=f"Failed to generate CSV: {e}")
 
-def send_to_api_sync(prompt, number_of_responses, response_types, search_mode):
-    try:
-        payload = {
-            'prompt': prompt,
-            'number_of_responses': number_of_responses,
-            'response_types': response_types,
-            'search_mode': search_mode
-        }
-        logger.info(f"Sending payload to API: {payload}")
-        response = requests.post(api_url, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-        logger.info(f"Received response from API: {response.json()}")
-        return response.json()
-    except requests.HTTPError as e:
-        logger.error(f"HTTP error occurred: {e.response.status_code} - {e.response.text}")
-        return {"responses": []}
-    except requests.RequestException as e:
-        logger.error(f"Error sending request to API: {e}")
-        return {"responses": []}
+# ------------------------ Root Endpoint ------------------------
+
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to the Main Server. Use appropriate endpoints to interact."}
 
 if __name__ =="__main__":
     uvicorn.run(app, host="0.0.0.0", port=5678, log_level="info")

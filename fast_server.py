@@ -13,9 +13,10 @@ import pytz
 
 from fastapi.middleware.cors import CORSMiddleware
 
-# Set up basic configuration for logging
+# ------------------------ Logging Configuration ------------------------
+
 logging.basicConfig(
-    level=logging.INFO,  # Change to DEBUG for more detailed logs
+    level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.FileHandler("server.log"),
@@ -24,40 +25,55 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ------------------------ FastAPI Initialization ------------------------
+
 app = FastAPI(title="Main Server", version="1.1")
 
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update with specific origins in production
+    allow_origins=["*"],  # Update with specific domains in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Asynchronous HTTP client
-client = httpx.AsyncClient()
+# ------------------------ HTTP Client Initialization ------------------------
 
-# Updated API URL to point to the LightRAG API
+client = httpx.AsyncClient()
 api_url = "http://localhost:7000/generate_response_informed"
 rasp_pi_api_url = "https://humane-marmot-entirely.ngrok-free.app"
 headers = {"Content-Type": "application/json"}
 
-# Directory to store session CSV files
+# ------------------------ CSV Configuration ------------------------
+
 session_csv_dir = "session_csv_files"
 os.makedirs(session_csv_dir, exist_ok=True)
 
-# In-memory history of the conversation (last 3 prompts and responses)
-conversation_history = []
-full_conversation_history = []
+# Updated CSV headers to include the full prompt sent to the API
+CSV_HEADERS = [
+    'index', 'date_time', 'prompt', 'history', 'responses',
+    'chosen_response', 'server_to_pi_latency',
+    'pi_to_server_latency', 'api_latency', 'chosen_response_latency', 'full_prompt_to_api'
+]
+
+# ------------------------ In-Memory Conversation Histories ------------------------
+
+conversation_history = []      # Stores recent conversation states (up to last 3)
+full_conversation_history = [] # Stores all conversation states
+
+# Global variables
 csv_file_path = None
 time_responses_sent = None
-time_chosen_response_received = None
 
-# Eastern Time zone with DST handling
+# We will store the last full prompt to the API in conversation_history or a separate variable
+last_full_prompt_to_api = None
+
+# Eastern Time zone
 ET = pytz.timezone('US/Eastern')
 
-# Generate a unique filename for each session
+# ------------------------ Helper Functions ------------------------
+
 def generate_csv_filename():
     timestamp = datetime.now(ET).strftime("%Y%m%d_%H%M%S")
     return os.path.join(session_csv_dir, f"conversation_history_{timestamp}.csv")
@@ -65,22 +81,17 @@ def generate_csv_filename():
 def initialize_csv_file(path):
     try:
         with open(path, 'w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            writer.writerow([
-                'index', 'date_time', 'prompt', 'history', 'responses', 
-                'chosen_response', 'response_type', 'server_to_pi_latency', 
-                'pi_processing_latency', 'pi_to_server_latency', 
-                'api_latency', 'chosen_response_latency'
-            ])
+            writer = csv.DictWriter(file, fieldnames=CSV_HEADERS)
+            writer.writeheader()
         logger.info(f"Initialized CSV file at {path}")
     except Exception as e:
         logger.error(f"Failed to create CSV: {e}")
 
-def append_to_csv_file(path, entry):
+def append_to_csv_file(path, entry_dict):
     try:
         with open(path, 'a', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            writer.writerow(entry)
+            writer = csv.DictWriter(file, fieldnames=CSV_HEADERS)
+            writer.writerow(entry_dict)
         logger.info(f"Appended entry to CSV at {path}")
     except Exception as e:
         logger.error(f"Failed to append to CSV: {e}")
@@ -90,7 +101,7 @@ async def get_speech_to_text():
         response = await client.get(f'{rasp_pi_api_url}/get_audio_transcription', timeout=10)
         response.raise_for_status()
         data_json = response.json()
-        logger.debug(f"RPi API Response: {data_json}")  # Debugging log
+        logger.debug(f"RPi API Response: {data_json}")
         return data_json
     except httpx.RequestError as e:
         logger.error(f"Error fetching speech-to-text: {e}")
@@ -100,14 +111,14 @@ async def get_speech_to_text():
         return {}
 
 async def send_to_api_async(prompt, number_of_responses, response_types, search_mode):
+    payload = {
+        'prompt': prompt,
+        'number_of_responses': number_of_responses,
+        'response_types': response_types,
+        'search_mode': search_mode
+    }
+    logger.info(f"Sending payload to API with prompt:\n{prompt}")
     try:
-        payload = {
-            'prompt': prompt,
-            'number_of_responses': number_of_responses,
-            'response_types': response_types,
-            'search_mode': search_mode
-        }
-        logger.info(f"Sending payload to API: {payload}")
         response = await client.post(api_url, headers=headers, json=payload, timeout=30)
         response.raise_for_status()
         response_json = response.json()
@@ -121,40 +132,98 @@ async def send_to_api_async(prompt, number_of_responses, response_types, search_
         return {"responses": []}
 
 def check_last_entry(history):
-    if history and history[-1][1] is None:
+    if history and history[-1]['user_response'] is None:
         logger.warning("Incomplete entry found in conversation history.")
         return handle_incomplete_entry(history)
     return None
 
 def handle_incomplete_entry(history):
     incomplete_entry = history.pop()
-    logger.info(f"Removed incomplete entry: {incomplete_entry[0]}")
-    return f"Didn't choose a response; removed: {incomplete_entry[0]}"
+    logger.info(f"Removed incomplete entry: {incomplete_entry['prompt']}")
+    return f"Didn't choose a response; removed: {incomplete_entry['prompt']}"
 
-def update_history(history, partner_prompt, user_response, model_responses, full_history, emotion, server_to_pi_latency, pi_processing_latency, pi_to_server_latency, api_latency):
-    history_snapshot = history[-3:]
-    while len(history) > 3:
-        history.pop(0)
-    history.append((partner_prompt, user_response, server_to_pi_latency, pi_processing_latency, pi_to_server_latency, api_latency))
+def format_conversation_history_for_prompt(conversation_history):
+    """
+    Format the last few turns of the conversation as context:
+    Partner: <partner_prompt>
+    User: <chosen_response>
+    """
+    entries = conversation_history[-3:]
+    history_str = "Conversation so far:\n"
+    for h in entries:
+        history_str += f"Partner: {h['prompt']}\n"
+        if h['user_response']:
+            history_str += f"User: {h['user_response']}\n"
+    return history_str.strip()
+
+def update_history(history, partner_prompt, user_response, model_responses, full_history, emotion, server_to_pi_latency, pi_to_server_latency, api_latency):
+    if len(history) >= 3:
+        removed = history.pop(0)
+        logger.debug(f"Removed oldest entry from conversation history: {removed['prompt']}")
+
+    history.append({
+        'prompt': partner_prompt,
+        'user_response': user_response,
+        'server_to_pi_latency': server_to_pi_latency,
+        'pi_to_server_latency': pi_to_server_latency,
+        'api_latency': api_latency
+    })
+
     if model_responses is not None:
-        full_history.append((partner_prompt, model_responses, user_response, history_snapshot, emotion))
+        history_snapshot = history[-3:].copy()
+        full_history.append({
+            'prompt': partner_prompt,
+            'responses': model_responses,
+            'user_response': user_response,
+            'history_snapshot': history_snapshot,
+            'emotion': emotion
+        })
 
 def update_full_history(full_history, last_convo_pair, chosen_response):
-    for index, (partner_prompt, model_responses, user_response, history_snapshot, emotion) in enumerate(full_history):
-        if partner_prompt == last_convo_pair[0] and user_response is None:
-            full_history[index] = (partner_prompt, model_responses, chosen_response, history_snapshot, emotion)
+    for entry in reversed(full_history):
+        if entry['prompt'] == last_convo_pair['prompt'] and entry['user_response'] is None:
+            entry['user_response'] = chosen_response
             break
+
+def format_history_for_csv(history_snapshot):
+    """
+    Convert the history snapshot into a readable string for CSV:
+    Partner: <prompt>
+    User: <chosen_response>
+    """
+    lines = []
+    for h in history_snapshot:
+        lines.append(f"Partner: {h['prompt']}")
+        if h['user_response']:
+            lines.append(f"User: {h['user_response']}")
+    return "\n".join(lines)
+
+def format_responses_for_csv(responses_list):
+    """
+    Convert the responses into a readable string separated by ' || '
+    """
+    resp_texts = [r.get('response_text', '') for r in responses_list]
+    return " || ".join(resp_texts)
+
+# ------------------------ WebSocket Endpoint ------------------------
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     global csv_file_path, conversation_history, full_conversation_history, time_responses_sent
+    global last_full_prompt_to_api
+
+    # Start a new conversation session: generate and initialize CSV
     csv_file_path = generate_csv_filename()
     conversation_history = []
     full_conversation_history = []
+    time_responses_sent = None
+    last_full_prompt_to_api = None
     initialize_csv_file(csv_file_path)
 
     await websocket.accept()
     logger.info("WebSocket connection accepted.")
+
     try:
         while True:
             data = await websocket.receive_text()
@@ -169,183 +238,180 @@ async def websocket_endpoint(websocket: WebSocket):
                 emotion = state.get("$Style", "")
 
                 if prefix == 'prompt':
+                    # Check for incomplete entry
                     incomplete_message = check_last_entry(conversation_history)
-                    
+
+                    # Send request to RPi for speech-to-text
                     time_server_sent_to_rasp_pi = datetime.now(ET)
                     rasp_pi_data = await get_speech_to_text()
                     time_server_received_from_rasp_pi = datetime.now(ET)
-                    
-                    # Correctly extract 'transcript' instead of 'text'
-                    prompt = rasp_pi_data.get('transcript', '')
-                    logger.debug(f"Extracted prompt: '{prompt}'")
-                    if not prompt.strip():
+
+                    # Extract prompt from partner
+                    partner_prompt = rasp_pi_data.get('transcript', '').strip()
+                    if not partner_prompt:
                         logger.error("No prompt text received from RPi API.")
                         await websocket.send_text(json.dumps({'error': 'No prompt text received.'}))
                         continue
 
-                    # Parse timestamps; fallback to current time if not provided
+                    # Parse timestamps from RPi API
                     try:
-                        time_rasp_pi_received_from_server = parse(
-                            rasp_pi_data.get('time_received', datetime.now().isoformat())
-                        ).astimezone(ET)
-                    except Exception as e:
-                        logger.error(f"Error parsing 'time_received': {e}")
+                        time_rasp_pi_received_from_server = parse(rasp_pi_data.get('time_received', datetime.now().isoformat())).astimezone(ET)
+                    except Exception:
                         time_rasp_pi_received_from_server = datetime.now(ET)
 
                     try:
-                        time_rasp_pi_sent_to_server = parse(
-                            rasp_pi_data.get('time_processed', datetime.now().isoformat())
-                        ).astimezone(ET)
-                    except Exception as e:
-                        logger.error(f"Error parsing 'time_processed': {e}")
+                        time_rasp_pi_sent_to_server = parse(rasp_pi_data.get('time_processed', datetime.now().isoformat())).astimezone(ET)
+                    except Exception:
                         time_rasp_pi_sent_to_server = datetime.now(ET)
-
-                    pi_processing_latency = rasp_pi_data.get('total_request_time_s', 0)
 
                     server_to_pi_latency = (time_rasp_pi_received_from_server - time_server_sent_to_rasp_pi).total_seconds()
                     pi_to_server_latency = (time_server_received_from_rasp_pi - time_rasp_pi_sent_to_server).total_seconds()
 
-                    logger.info(f"Prompt received: {prompt}")
-                    message = json.dumps({'state': {"$Display": prompt}})
-                    
-                    logger.debug(f"Latencies - Server to Pi: {server_to_pi_latency}, Pi Processing: {pi_processing_latency}, Pi to Server: {pi_to_server_latency}")
+                    logger.info(f"Partner prompt received: {partner_prompt}")
+                    logger.debug(f"Latencies - Server to Pi: {server_to_pi_latency}s, Pi to Server: {pi_to_server_latency}s")
 
-                    await websocket.send_text(message)
+                    # Echo prompt back to UI
+                    await websocket.send_text(json.dumps({'state': {"$Display": partner_prompt}}))
 
-                    if prompt:
-                        logger.info(f"Sending prompt to API with Emotion: {emotion}")
-                        api_request_start_time = datetime.now(ET)
-                        response = await send_to_api_async(
-                            prompt, 
-                            number_of_responses=2,  # Example: 2 responses
-                            response_types=["positive", "negative"],  # Example types
-                            search_mode="hybrid"  # Example search mode
-                        )
-                        api_request_end_time = datetime.now(ET)
+                    # Add conversation history to the prompt for context
+                    history_context = format_conversation_history_for_prompt(conversation_history)
+                    final_prompt_to_api = f"{history_context}\nPartner: {partner_prompt}\n\nPlease respond accordingly."
+                    # Store it globally so we can use it later when chosen response is picked
+                    last_full_prompt_to_api = final_prompt_to_api
 
-                        api_latency = (api_request_end_time - api_request_start_time).total_seconds()
+                    # Send prompt to LightRAG API
+                    api_request_start_time = datetime.now(ET)
+                    response = await send_to_api_async(
+                        final_prompt_to_api,
+                        number_of_responses=2,
+                        response_types=["positive", "negative"],
+                        search_mode="hybrid"
+                    )
+                    api_request_end_time = datetime.now(ET)
+                    api_latency = (api_request_end_time - api_request_start_time).total_seconds()
 
-                        responses_list = response.get('responses', [])
-                        logger.debug(f"Responses from LightRAG API: {responses_list}")
+                    responses_list = response.get('responses', [])
+                    # Ensure at least 2 responses
+                    while len(responses_list) < 2:
+                        responses_list.append({'response_text': 'No response available.'})
 
-                        # Handle cases where the number of responses received is less than expected
-                        expected_responses = 2  # As per 'number_of_responses'
-                        actual_responses = len(responses_list)
-                        if actual_responses < expected_responses:
-                            logger.warning(f"Expected {expected_responses} responses, but received {actual_responses}.")
-                            # Pad the responses_list with default responses
-                            for _ in range(expected_responses - actual_responses):
-                                responses_list.append({'response_text': 'No response available.'})
+                    # Hard-coded response keys again
+                    responses_dict = {
+                        'Display': partner_prompt,
+                        'response1': responses_list[0].get('response_text', ''),
+                        'response2': responses_list[1].get('response_text', '')
+                    }
 
-                        # Construct responses_dict dynamically based on number_of_responses
-                        responses_dict = {}
-                        for i in range(expected_responses):
-                            resp = responses_list[i] if i < len(responses_list) else {'response_text': 'No response available.'}
-                            response_text = resp.get('response_text', '')
-                            responses_dict[f"response{i+1}"] = response_text
-                        
-                        responses_dict['Display'] = prompt
-                        if incomplete_message:
-                            responses_dict['warning'] = incomplete_message
+                    if incomplete_message:
+                        responses_dict['warning'] = incomplete_message
 
-                        logger.debug(f"API responses structured: {responses_dict}")
-                        time_responses_sent = datetime.now(ET)
-                        await websocket.send_text(json.dumps(responses_dict))
+                    time_responses_sent = datetime.now(ET)
+                    await websocket.send_text(json.dumps(responses_dict))
 
-                        # Update conversation history
-                        update_history(
-                            conversation_history, 
-                            prompt, 
-                            None, 
-                            responses_list, 
-                            full_conversation_history, 
-                            emotion, 
-                            server_to_pi_latency, 
-                            pi_processing_latency, 
-                            pi_to_server_latency, 
-                            api_latency
-                        )
-                    else:
-                        logger.error("No prompt found in the received data.")
-                
+                    # Update conversation histories with partner prompt and no chosen response yet
+                    update_history(
+                        conversation_history,
+                        partner_prompt,
+                        None,
+                        responses_list,
+                        full_conversation_history,
+                        emotion,
+                        server_to_pi_latency,
+                        pi_to_server_latency,
+                        api_latency
+                    )
+
                 elif prefix == 'Chosen':
                     chosen_response = state.get("$socket", "")
                     time_chosen_response_received = datetime.now(ET)
-                    chosen_response_latency = (time_chosen_response_received - time_responses_sent).total_seconds()
+                    chosen_response_latency = (time_chosen_response_received - time_responses_sent).total_seconds() if time_responses_sent else 0.0
 
                     if chosen_response:
                         logger.info(f"Received chosen response: {chosen_response}")
-                        if conversation_history and conversation_history[-1][1] is None:
-                            conversation_history[-1] = (conversation_history[-1][0], chosen_response)
+                        if conversation_history and conversation_history[-1]['user_response'] is None:
+                            # Update the last conversation pair with user's chosen response
+                            conversation_history[-1]['user_response'] = chosen_response
                             update_full_history(full_conversation_history, conversation_history[-1], chosen_response)
                             timestamp = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S")
-                            append_to_csv_file(csv_file_path, (
-                                len(conversation_history),
-                                timestamp,
-                                conversation_history[-1][0],
-                                json.dumps(full_conversation_history[-1][1], ensure_ascii=False),
-                                chosen_response,
-                                '',  # 'response_type' is omitted
-                                conversation_history[-1][2],  # server_to_pi_latency
-                                conversation_history[-1][3],  # pi_processing_latency
-                                conversation_history[-1][4],  # pi_to_server_latency
-                                conversation_history[-1][5],  # api_latency
-                                chosen_response_latency
-                            ))
+
+                            if not full_conversation_history:
+                                logger.error("Full conversation history is empty. Cannot append to CSV.")
+                                await websocket.send_text(json.dumps({'error': 'Conversation history is empty.'}))
+                                continue
+
+                            latest_full_entry = full_conversation_history[-1]
+
+                            # Format history and responses for CSV
+                            formatted_history = format_history_for_csv(latest_full_entry.get('history_snapshot', []))
+                            formatted_responses = format_responses_for_csv(latest_full_entry.get('responses', []))
+
+                            csv_entry = {
+                                'index': len(conversation_history),
+                                'date_time': timestamp,
+                                'prompt': conversation_history[-1]['prompt'],  # Partner prompt
+                                'history': formatted_history,
+                                'responses': formatted_responses,
+                                'chosen_response': chosen_response,
+                                'server_to_pi_latency': conversation_history[-1]['server_to_pi_latency'],
+                                'pi_to_server_latency': conversation_history[-1]['pi_to_server_latency'],
+                                'api_latency': conversation_history[-1]['api_latency'],
+                                'chosen_response_latency': chosen_response_latency,
+                                'full_prompt_to_api': last_full_prompt_to_api if last_full_prompt_to_api else ""
+                            }
+                            append_to_csv_file(csv_file_path, csv_entry)
                         else:
                             logger.error("Chosen response received without a corresponding prompt.")
+                            await websocket.send_text(json.dumps({'error': 'No corresponding prompt for chosen response.'}))
                     else:
                         logger.error("No chosen response found in the received data.")
-                
+                        await websocket.send_text(json.dumps({'error': 'Chosen response is empty.'}))
+
                 elif prefix == 'new_conv':
-                    logger.info("Received new_conv prefix, clearing conversation history and starting new conversation.")
+                    logger.info("Received 'new_conv' prefix, starting a new conversation.")
                     conversation_history.clear()
                     full_conversation_history.clear()
-                    if csv_file_path:
-                        append_to_csv_file(csv_file_path, ("", "", "", "", "", "", "", "", "", "", ""))
-                
+                    last_full_prompt_to_api = None
+
+                    # Reinitialize CSV file for a new conversation session
+                    csv_file_path = generate_csv_filename()
+                    initialize_csv_file(csv_file_path)
+                    time_responses_sent = None
+                    logger.info(f"New CSV file created at {csv_file_path} for the new conversation.")
+                    await websocket.send_text(json.dumps({'state': {"$Info": "New conversation started."}}))
+
                 else:
                     logger.error(f"Unexpected prefix value: {prefix}")
+                    await websocket.send_text(json.dumps({'error': f"Unexpected prefix value: {prefix}"}))
 
             except json.JSONDecodeError:
                 logger.error("Invalid JSON received.")
+                await websocket.send_text(json.dumps({'error': 'Invalid JSON format.'}))
             except Exception as e:
-                logger.error(f"An error occurred: {e}")
+                logger.error(f"An error occurred while processing the message: {e}")
+                await websocket.send_text(json.dumps({'error': 'Internal server error.'}))
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected.")
 
-def update_history(history, partner_prompt, user_response, model_responses, full_history, emotion, server_to_pi_latency, pi_processing_latency, pi_to_server_latency, api_latency):
-    history_snapshot = history[-3:]
-    while len(history) > 3:
-        history.pop(0)
-    history.append((partner_prompt, user_response, server_to_pi_latency, pi_processing_latency, pi_to_server_latency, api_latency))
-    if model_responses is not None:
-        full_history.append((partner_prompt, model_responses, user_response, history_snapshot, emotion))
 
-def update_full_history(full_history, last_convo_pair, chosen_response):
-    for index, (partner_prompt, model_responses, user_response, history_snapshot, emotion) in enumerate(full_history):
-        if partner_prompt == last_convo_pair[0] and user_response is None:
-            full_history[index] = (partner_prompt, model_responses, chosen_response, history_snapshot, emotion)
-            break
+# ------------------------ CSV Download Endpoint ------------------------
 
 @app.get("/download_csv")
 async def download_csv():
     global csv_file_path
-    try:
-        if csv_file_path and os.path.exists(csv_file_path):
-            return FileResponse(csv_file_path, media_type='text/csv', filename=os.path.basename(csv_file_path))
-        else:
-            logger.error("CSV file does not exist.")
-            raise HTTPException(status_code=404, detail="CSV file does not exist.")
-    except Exception as e:
-        logger.error(f"Failed to generate CSV: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate CSV: {e}")
+    if csv_file_path and os.path.exists(csv_file_path):
+        logger.info(f"CSV file found at {csv_file_path}. Preparing for download.")
+        return FileResponse(csv_file_path, media_type='text/csv', filename=os.path.basename(csv_file_path))
+    else:
+        logger.error("CSV file does not exist.")
+        raise HTTPException(status_code=404, detail="CSV file does not exist.")
+
 
 # ------------------------ Root Endpoint ------------------------
 
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the Main Server. Use appropriate endpoints to interact."}
+
 
 # ------------------------ Graceful Shutdown ------------------------
 
@@ -354,8 +420,9 @@ async def shutdown_event():
     await client.aclose()
     logger.info("httpx client closed.")
 
-# ------------------------ Run the Server ------------------------
 
-if __name__ =="__main__":
+if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=5678, log_level="info")
+
+
 

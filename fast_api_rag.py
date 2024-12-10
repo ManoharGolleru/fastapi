@@ -10,6 +10,7 @@ import time
 import uvicorn
 from dotenv import load_dotenv
 import asyncio
+import json
 
 # Load environment variables from .env file
 load_dotenv()
@@ -97,11 +98,13 @@ async def generate_response_informed(request: GenerateResponseRequest):
                 f"response_types: {request.response_types}, "
                 f"search_mode: {request.search_mode}")
 
-    # Define the system prompt
+    # Define the system prompt with JSON instruction
     system_prompt = (
         "As Todd, respond to the following question in a conversational manner, "
         "keeping each response under 15 words for brevity and relevance. "
-        "Focus on providing honest and personal answers that align with my perspective in the story."
+        "Focus on providing honest and personal answers that align with my perspective in the story. "
+        "Provide the responses in JSON format as a list of objects, each with 'response_type' and 'response_text' fields. "
+        "Return only the JSON without any additional text."
     )
 
     start_time = time.time()
@@ -117,21 +120,41 @@ async def generate_response_informed(request: GenerateResponseRequest):
 
         # Query LightRAG with the specified search mode
         response = await initialize_lightrag.aquery(system_query, QueryParam(mode=request.search_mode))
+        
+        # Debug logging
+        logger.debug(f"Type of response: {type(response)}")
+        logger.debug(f"Content of response: {response}")
 
-        # Ensure responses are in the expected format (list of dicts with 'response' key)
+        # Parse the response if it's a string
+        if isinstance(response, str):
+            try:
+                response = json.loads(response)
+                logger.debug("Parsed JSON string into dictionary.")
+            except json.JSONDecodeError as e:
+                logger.error("Failed to parse JSON string.", exc_info=True)
+                raise HTTPException(status_code=500, detail="Invalid response format from LightRAG.")
+
+        # Ensure responses are in the expected format (list of dicts with 'response_type' and 'response_text' keys)
         responses = response.get('responses', [])
-        if all(isinstance(resp, str) for resp in responses):
-            logger.warning("Responses are list of strings; wrapping into dicts.")
-            response['responses'] = [{'response': resp} for resp in responses]
+        if not isinstance(responses, list):
+            logger.error("Responses key is not a list.")
+            raise HTTPException(status_code=500, detail="Invalid response structure from LightRAG.")
+
+        # Validate each response item
+        for resp in responses:
+            if not isinstance(resp, dict):
+                logger.error("Each response should be a dictionary.")
+                raise HTTPException(status_code=500, detail="Invalid response item format from LightRAG.")
+            if 'response_type' not in resp or 'response_text' not in resp:
+                logger.error("Missing 'response_type' or 'response_text' in response item.")
+                raise HTTPException(status_code=500, detail="Incomplete response item from LightRAG.")
 
         # Validate and structure responses
         generated_responses = []
-        for idx, resp in enumerate(response.get('responses', [])):
-            # Handle cases where response might still be a string
-            response_text = resp.get('response', '') if isinstance(resp, dict) else resp
+        for idx, resp in enumerate(responses):
             generated_responses.append(GeneratedResponse(
-                response_type=request.response_types[idx] if idx < len(request.response_types) else "unknown",
-                response_text=response_text,
+                response_type=resp.get('response_type', 'unknown'),
+                response_text=resp.get('response_text', ''),
                 latency_seconds=round(time.time() - start_time, 2)
             ))
 
@@ -140,19 +163,11 @@ async def generate_response_informed(request: GenerateResponseRequest):
 
         return GenerateResponseResponse(responses=generated_responses, total_latency_seconds=total_latency)
 
+    except json.JSONDecodeError as json_err:
+        logger.error(f"JSON decoding error: {json_err}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to parse response from LightRAG.")
     except Exception as e:
-        logger.error(f"Error generating response: {e}")
+        logger.error(f"Error generating response: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error.")
-
-# ------------------------ Root Endpoint ------------------------
-
-@app.get("/")
-def read_root():
-    return {"message": "Welcome to the LightRAG API. Use /generate_response_informed to generate responses."}
-
-# ------------------------ Run the API ------------------------
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=7000)
 
 

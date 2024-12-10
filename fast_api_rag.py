@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Security
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from lightrag import LightRAG, QueryParam
@@ -11,10 +11,6 @@ import uvicorn
 from dotenv import load_dotenv
 import asyncio
 import json
-import nest_asyncio
-
-# Apply nest_asyncio to handle nested event loops if necessary (e.g., in Jupyter environments)
-nest_asyncio.apply()
 
 # Load environment variables from .env file
 load_dotenv()
@@ -211,5 +207,6 @@ def read_root():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=7000)
+
 
 

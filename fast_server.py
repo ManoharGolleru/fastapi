@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # Set up basic configuration for logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,  # Change to DEBUG for more detailed logs
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.FileHandler("server.log"),
@@ -40,7 +40,7 @@ client = httpx.AsyncClient()
 
 # Updated API URL to point to the LightRAG API
 api_url = "http://localhost:7000/generate_response_informed"
-rasp_pi_api_url = "https://humane-marmot-entirely.ngrok-free.app/"
+rasp_pi_api_url = "https://humane-marmot-entirely.ngrok-free.app"
 headers = {"Content-Type": "application/json"}
 
 # Directory to store session CSV files
@@ -90,6 +90,7 @@ async def get_speech_to_text():
         response = await client.get(f'{rasp_pi_api_url}/get_audio_transcription', timeout=10)
         response.raise_for_status()
         data_json = response.json()
+        logger.debug(f"RPi API Response: {data_json}")  # Debugging log
         return data_json
     except httpx.RequestError as e:
         logger.error(f"Error fetching speech-to-text: {e}")
@@ -109,8 +110,9 @@ async def send_to_api_async(prompt, number_of_responses, response_types, search_
         logger.info(f"Sending payload to API: {payload}")
         response = await client.post(api_url, headers=headers, json=payload, timeout=30)
         response.raise_for_status()
-        logger.info(f"Received response from API: {response.json()}")
-        return response.json()
+        response_json = response.json()
+        logger.info(f"Received response from API: {response_json}")
+        return response_json
     except httpx.HTTPStatusError as e:
         logger.error(f"HTTP error occurred: {e.response.status_code} - {e.response.text}")
         return {"responses": []}
@@ -173,8 +175,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     rasp_pi_data = await get_speech_to_text()
                     time_server_received_from_rasp_pi = datetime.now(ET)
                     
-                    prompt = rasp_pi_data.get('text', '')
-                    if not prompt:
+                    # Correctly extract 'transcript' instead of 'text'
+                    prompt = rasp_pi_data.get('transcript', '')
+                    logger.debug(f"Extracted prompt: '{prompt}'")
+                    if not prompt.strip():
                         logger.error("No prompt text received from RPi API.")
                         await websocket.send_text(json.dumps({'error': 'No prompt text received.'}))
                         continue
@@ -184,15 +188,19 @@ async def websocket_endpoint(websocket: WebSocket):
                         time_rasp_pi_received_from_server = parse(
                             rasp_pi_data.get('time_received', datetime.now().isoformat())
                         ).astimezone(ET)
-                    except Exception:
+                    except Exception as e:
+                        logger.error(f"Error parsing 'time_received': {e}")
                         time_rasp_pi_received_from_server = datetime.now(ET)
+
                     try:
                         time_rasp_pi_sent_to_server = parse(
                             rasp_pi_data.get('time_processed', datetime.now().isoformat())
                         ).astimezone(ET)
-                    except Exception:
+                    except Exception as e:
+                        logger.error(f"Error parsing 'time_processed': {e}")
                         time_rasp_pi_sent_to_server = datetime.now(ET)
-                    pi_processing_latency = rasp_pi_data.get('total_time', 0)
+
+                    pi_processing_latency = rasp_pi_data.get('total_request_time_s', 0)
 
                     server_to_pi_latency = (time_rasp_pi_received_from_server - time_server_sent_to_rasp_pi).total_seconds()
                     pi_to_server_latency = (time_server_received_from_rasp_pi - time_rasp_pi_sent_to_server).total_seconds()
@@ -218,19 +226,33 @@ async def websocket_endpoint(websocket: WebSocket):
                         api_latency = (api_request_end_time - api_request_start_time).total_seconds()
 
                         responses_list = response.get('responses', [])
+                        logger.debug(f"Responses from LightRAG API: {responses_list}")
 
-                        # Structure the responses to include type and text
-                        responses_dict = {
-                            f"response{i+1}": {
-                                "type": resp['response_type'],
-                                "text": resp['response_text']
-                            } for i, resp in enumerate(responses_list)
-                        }
+                        # Handle cases where the number of responses received is less than requested
+                        expected_responses = 2  # As per 'number_of_responses'
+                        actual_responses = len(responses_list)
+                        if actual_responses < expected_responses:
+                            logger.warning(f"Expected {expected_responses} responses, but received {actual_responses}.")
+                            # Optionally, pad the responses_list with empty responses or duplicates
+                            for _ in range(expected_responses - actual_responses):
+                                responses_list.append({'response_type': 'unknown', 'response_text': 'No response available.'})
+
+                        # Construct responses_dict dynamically based on number_of_responses
+                        responses_dict = {}
+                        for i in range(expected_responses):
+                            resp = responses_list[i] if i < len(responses_list) else {'response_type': 'unknown', 'response_text': 'No response available.'}
+                            response_type = resp.get('response_type', 'unknown')
+                            response_text = resp.get('response_text', '')
+                            responses_dict[f"response{i+1}"] = {
+                                "type": response_type,
+                                "text": response_text
+                            }
+                        
                         responses_dict['Display'] = prompt
                         if incomplete_message:
                             responses_dict['warning'] = incomplete_message
 
-                        logger.debug(f"API responses: {responses_dict}")
+                        logger.debug(f"API responses structured: {responses_dict}")
                         time_responses_sent = datetime.now(ET)
                         await websocket.send_text(json.dumps(responses_dict))
 
@@ -329,7 +351,14 @@ async def download_csv():
 def read_root():
     return {"message": "Welcome to the Main Server. Use appropriate endpoints to interact."}
 
+# ------------------------ Graceful Shutdown ------------------------
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await client.aclose()
+    logger.info("httpx client closed.")
+
 # ------------------------ Run the Server ------------------------
 
-if __name__ =="__main__":
+if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=5678, log_level="info")

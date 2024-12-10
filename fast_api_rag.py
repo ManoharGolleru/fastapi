@@ -1,6 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Security
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional
 from lightrag import LightRAG, QueryParam
 from lightrag.llm import gpt_4o_mini_complete
 import os
@@ -10,16 +10,20 @@ import time
 import uvicorn
 from dotenv import load_dotenv
 import asyncio
-import json  # Ensure json is imported
+import json
+import nest_asyncio
+
+# Apply nest_asyncio to handle nested event loops if necessary (e.g., in Jupyter environments)
+nest_asyncio.apply()
 
 # Load environment variables from .env file
 load_dotenv()
 
 # Initialize logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)  # Set to DEBUG for detailed logs
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="LightRAG API", version="1.2")
+app = FastAPI(title="LightRAG API", version="1.2", description="API for Retrieval-Augmented Generation operations")
 
 # ------------------------ Configuration ------------------------
 
@@ -29,37 +33,48 @@ if not OPENAI_API_KEY:
     logger.error("OPENAI_API_KEY is not set in environment variables.")
     raise EnvironmentError("OPENAI_API_KEY is required.")
 
+# Set the OpenAI API key environment variable
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+
+# Define paths
+ZIP_PATH = "book_backup.zip"
+EXTRACTION_PATH = "book_data/"
 
 # ------------------------ Initialize LightRAG ------------------------
 
-class InitializeLightRAG:
-    def __init__(self, zip_path: str = "book_backup.zip", extraction_path: str = "book_data/"):
-        self.zip_path = zip_path
-        self.extraction_path = extraction_path
-        self.rag = None
-        self.initialize()
+# Global variable for LightRAG instance
+rag: Optional[LightRAG] = None
 
-    def initialize(self):
-        if not os.path.exists(self.extraction_path):
-            if not os.path.exists(self.zip_path):
-                logger.error(f"Zip file {self.zip_path} does not exist.")
-                raise FileNotFoundError(f"{self.zip_path} not found.")
-            shutil.unpack_archive(self.zip_path, self.extraction_path)
-            logger.info(f"📦 Book folder unzipped to: {self.extraction_path}")
-        self.rag = LightRAG(
-            working_dir=self.extraction_path,
-            llm_model_func=gpt_4o_mini_complete
-        )
-        logger.info("🔄 LightRAG system initialized.")
-    
-    async def aquery(self, query: str, param: QueryParam):
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(None, self.rag.query, query, param)
-        return response
+# Asynchronous function to initialize LightRAG
+async def initialize_lightrag():
+    global rag
+    if not os.path.exists(EXTRACTION_PATH):
+        if not os.path.exists(ZIP_PATH):
+            logger.error(f"Zip file {ZIP_PATH} does not exist.")
+            raise FileNotFoundError(f"{ZIP_PATH} not found.")
+        shutil.unpack_archive(ZIP_PATH, EXTRAC_PATH)
+        logger.info(f"📦 Book folder unzipped to: {EXTRACTION_PATH}")
 
-# Initialize LightRAG once when the API starts
-initialize_lightrag = InitializeLightRAG()
+    # Initialize LightRAG
+    rag = LightRAG(
+        working_dir=EXTRACTION_PATH,
+        llm_model_func=gpt_4o_mini_complete
+    )
+    logger.info("🔄 LightRAG system initialized.")
+
+# Define FastAPI startup event to initialize LightRAG
+@app.on_event("startup")
+async def startup_event():
+    await initialize_lightrag()
+
+# ------------------------ Helper Functions ------------------------
+
+# Define a helper async function to query LightRAG
+async def aquery(query: str, param: QueryParam):
+    loop = asyncio.get_running_loop()
+    # Run the synchronous rag.query in a separate thread to avoid blocking
+    response = await loop.run_in_executor(None, rag.query, query, param)
+    return response
 
 # ------------------------ Request and Response Models ------------------------
 
@@ -78,7 +93,7 @@ class GenerateResponseResponse(BaseModel):
     responses: List[GeneratedResponse]
     total_latency_seconds: float
 
-# ------------------------ API Endpoint ------------------------
+# ------------------------ API Endpoints ------------------------
 
 @app.post("/generate_response_informed", response_model=GenerateResponseResponse)
 async def generate_response_informed(request: GenerateResponseRequest):
@@ -98,28 +113,33 @@ async def generate_response_informed(request: GenerateResponseRequest):
                 f"response_types: {request.response_types}, "
                 f"search_mode: {request.search_mode}")
 
-    # Define the system prompt with JSON instruction
+    # Define the system prompt with JSON instruction and example
     system_prompt = (
         "As Todd, respond to the following question in a conversational manner, "
         "keeping each response under 15 words for brevity and relevance. "
         "Focus on providing honest and personal answers that align with my perspective in the story. "
         "Provide the responses in JSON format as a list of objects, each containing 'response_type' and 'response_text' fields. "
-        "Return only the JSON without any additional text."
+        "Return only the JSON without any additional text.\n\n"
+        "Example:\n"
+        "[\n"
+        "  {\"response_type\": \"positive\", \"response_text\": \"Reduces carbon emissions.\"},\n"
+        "  {\"response_type\": \"negative\", \"response_text\": \"High initial costs.\"}\n"
+        "]\n\n"
     )
+
+    # Construct the system query by combining system_prompt with the user prompt
+    system_query = (
+        f"{system_prompt}\n\n"
+        f"Question: {request.prompt}\n\n"
+        f"Provide {request.number_of_responses} responses as follows:\n"
+    )
+    for i, resp_type in enumerate(request.response_types, start=1):
+        system_query += f"{i}. {resp_type.capitalize()} response:\n"
 
     start_time = time.time()
     try:
-        # Construct the system query by combining system_prompt with the user prompt
-        system_query = (
-            f"{system_prompt}\n\n"
-            f"Question: {request.prompt}\n\n"
-            f"Provide {request.number_of_responses} responses as follows:\n"
-        )
-        for i, resp_type in enumerate(request.response_types, start=1):
-            system_query += f"{i}. {resp_type.capitalize()} response:\n"
-
         # Query LightRAG with the specified search mode
-        response = await initialize_lightrag.aquery(system_query, QueryParam(mode=request.search_mode))
+        response = await aquery(system_query, QueryParam(mode=request.search_mode))
 
         # Debug logging to inspect the response
         logger.debug(f"Type of response: {type(response)}")
@@ -137,10 +157,16 @@ async def generate_response_informed(request: GenerateResponseRequest):
                 logger.error("Failed to parse JSON string.", exc_info=True)
                 raise HTTPException(status_code=500, detail="Invalid response format from LightRAG.")
 
-        # Ensure responses are in the expected format (list of dicts with 'response_type' and 'response_text' keys)
-        responses = response.get('responses', [])
-        if not isinstance(responses, list):
-            logger.error("Responses key is not a list.")
+        # Handle response as list or dict
+        if isinstance(response, list):
+            responses = response
+        elif isinstance(response, dict):
+            responses = response.get('responses', [])
+            if not responses:
+                logger.error("No 'responses' key found in the response.")
+                raise HTTPException(status_code=500, detail="Invalid response structure from LightRAG.")
+        else:
+            logger.error("Unexpected response type.")
             raise HTTPException(status_code=500, detail="Invalid response structure from LightRAG.")
 
         # Validate each response item
@@ -154,7 +180,7 @@ async def generate_response_informed(request: GenerateResponseRequest):
 
         # Validate and structure responses
         generated_responses = []
-        for idx, resp in enumerate(responses):
+        for resp in responses:
             generated_responses.append(GeneratedResponse(
                 response_type=resp.get('response_type', 'unknown'),
                 response_text=resp.get('response_text', ''),

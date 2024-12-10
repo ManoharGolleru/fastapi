@@ -228,25 +228,21 @@ async def websocket_endpoint(websocket: WebSocket):
                         responses_list = response.get('responses', [])
                         logger.debug(f"Responses from LightRAG API: {responses_list}")
 
-                        # Handle cases where the number of responses received is less than requested
+                        # Handle cases where the number of responses received is less than expected
                         expected_responses = 2  # As per 'number_of_responses'
                         actual_responses = len(responses_list)
                         if actual_responses < expected_responses:
                             logger.warning(f"Expected {expected_responses} responses, but received {actual_responses}.")
-                            # Optionally, pad the responses_list with empty responses or duplicates
+                            # Pad the responses_list with default responses
                             for _ in range(expected_responses - actual_responses):
-                                responses_list.append({'response_type': 'unknown', 'response_text': 'No response available.'})
+                                responses_list.append({'response_text': 'No response available.'})
 
                         # Construct responses_dict dynamically based on number_of_responses
                         responses_dict = {}
                         for i in range(expected_responses):
-                            resp = responses_list[i] if i < len(responses_list) else {'response_type': 'unknown', 'response_text': 'No response available.'}
-                            response_type = resp.get('response_type', 'unknown')
+                            resp = responses_list[i] if i < len(responses_list) else {'response_text': 'No response available.'}
                             response_text = resp.get('response_text', '')
-                            responses_dict[f"response{i+1}"] = {
-                                "type": response_type,
-                                "text": response_text
-                            }
+                            responses_dict[f"response{i+1}"] = response_text
                         
                         responses_dict['Display'] = prompt
                         if incomplete_message:
@@ -289,7 +285,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 conversation_history[-1][0],
                                 json.dumps(full_conversation_history[-1][1], ensure_ascii=False),
                                 chosen_response,
-                                full_conversation_history[-1][4],
+                                '',  # 'response_type' is omitted
                                 conversation_history[-1][2],  # server_to_pi_latency
                                 conversation_history[-1][3],  # pi_processing_latency
                                 conversation_history[-1][4],  # pi_to_server_latency
@@ -360,5 +356,6 @@ async def shutdown_event():
 
 # ------------------------ Run the Server ------------------------
 
-if __name__ == "__main__":
+if __name__ =="__main__":
     uvicorn.run(app, host="0.0.0.0", port=5678, log_level="info")
+

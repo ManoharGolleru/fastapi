@@ -10,7 +10,7 @@ import time
 import uvicorn
 from dotenv import load_dotenv
 import asyncio
-import json
+import json  # Ensure json is imported
 
 # Load environment variables from .env file
 load_dotenv()
@@ -103,7 +103,7 @@ async def generate_response_informed(request: GenerateResponseRequest):
         "As Todd, respond to the following question in a conversational manner, "
         "keeping each response under 15 words for brevity and relevance. "
         "Focus on providing honest and personal answers that align with my perspective in the story. "
-        "Provide the responses in JSON format as a list of objects, each with 'response_type' and 'response_text' fields. "
+        "Provide the responses in JSON format as a list of objects, each containing 'response_type' and 'response_text' fields. "
         "Return only the JSON without any additional text."
     )
 
@@ -120,13 +120,16 @@ async def generate_response_informed(request: GenerateResponseRequest):
 
         # Query LightRAG with the specified search mode
         response = await initialize_lightrag.aquery(system_query, QueryParam(mode=request.search_mode))
-        
-        # Debug logging
+
+        # Debug logging to inspect the response
         logger.debug(f"Type of response: {type(response)}")
         logger.debug(f"Content of response: {response}")
 
         # Parse the response if it's a string
         if isinstance(response, str):
+            if not response.strip():
+                logger.error("Received empty response from LightRAG.")
+                raise HTTPException(status_code=500, detail="Received empty response from LightRAG.")
             try:
                 response = json.loads(response)
                 logger.debug("Parsed JSON string into dictionary.")
@@ -166,8 +169,21 @@ async def generate_response_informed(request: GenerateResponseRequest):
     except json.JSONDecodeError as json_err:
         logger.error(f"JSON decoding error: {json_err}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to parse response from LightRAG.")
+    except HTTPException as http_exc:
+        raise http_exc  # Re-raise HTTPExceptions to be handled by FastAPI
     except Exception as e:
         logger.error(f"Error generating response: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error.")
+
+# ------------------------ Root Endpoint ------------------------
+
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to the LightRAG API. Use /generate_response_informed to generate responses."}
+
+# ------------------------ Run the API ------------------------
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=7000)
 
 

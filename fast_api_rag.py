@@ -8,6 +8,10 @@ import shutil
 import logging
 import time
 import uvicorn
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO)
@@ -106,13 +110,14 @@ async def generate_response_informed(request: GenerateResponseRequest):
             system_query += f"{i}. {resp_type.capitalize()} response:\n"
 
         # Query LightRAG with the specified search mode
-        response = initialize_lightrag.rag.query(system_query, param=QueryParam(mode=request.search_mode))
+        # Assuming 'aquery' is an asynchronous method
+        response = await initialize_lightrag.rag.aquery(system_query, param=QueryParam(mode=request.search_mode))
 
         # Validate and structure responses
         generated_responses = []
-        for idx, (resp_type, resp) in enumerate(zip(request.response_types, response.get('responses', []))):
+        for idx, resp in enumerate(response.get('responses', [])):
             generated_responses.append(GeneratedResponse(
-                response_type=resp_type,
+                response_type=request.response_types[idx],
                 response_text=resp.get('response', ''),
                 latency_seconds=round(time.time() - start_time, 2)
             ))
@@ -136,3 +141,4 @@ def read_root():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=7000)
+

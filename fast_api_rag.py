@@ -9,6 +9,7 @@ import logging
 import time
 import uvicorn
 from dotenv import load_dotenv
+import asyncio
 
 # Load environment variables from .env file
 load_dotenv()
@@ -50,6 +51,11 @@ class InitializeLightRAG:
             llm_model_func=gpt_4o_mini_complete
         )
         logger.info("🔄 LightRAG system initialized.")
+    
+    async def aquery(self, query: str, param: QueryParam):
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(None, self.rag.query, query, param)
+        return response
 
 # Initialize LightRAG once when the API starts
 initialize_lightrag = InitializeLightRAG()
@@ -110,15 +116,22 @@ async def generate_response_informed(request: GenerateResponseRequest):
             system_query += f"{i}. {resp_type.capitalize()} response:\n"
 
         # Query LightRAG with the specified search mode
-        # Assuming 'aquery' is an asynchronous method
-        response = await initialize_lightrag.rag.aquery(system_query, param=QueryParam(mode=request.search_mode))
+        response = await initialize_lightrag.aquery(system_query, QueryParam(mode=request.search_mode))
+
+        # Ensure responses are in the expected format (list of dicts with 'response' key)
+        responses = response.get('responses', [])
+        if all(isinstance(resp, str) for resp in responses):
+            logger.warning("Responses are list of strings; wrapping into dicts.")
+            response['responses'] = [{'response': resp} for resp in responses]
 
         # Validate and structure responses
         generated_responses = []
         for idx, resp in enumerate(response.get('responses', [])):
+            # Handle cases where response might still be a string
+            response_text = resp.get('response', '') if isinstance(resp, dict) else resp
             generated_responses.append(GeneratedResponse(
-                response_type=request.response_types[idx],
-                response_text=resp.get('response', ''),
+                response_type=request.response_types[idx] if idx < len(request.response_types) else "unknown",
+                response_text=response_text,
                 latency_seconds=round(time.time() - start_time, 2)
             ))
 
@@ -141,4 +154,5 @@ def read_root():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=7000)
+
 

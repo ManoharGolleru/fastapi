@@ -52,7 +52,7 @@ async def initialize_lightrag():
         if not os.path.exists(ZIP_PATH):
             logger.error(f"Zip file {ZIP_PATH} does not exist.")
             raise FileNotFoundError(f"{ZIP_PATH} not found.")
-        shutil.unpack_archive(ZIP_PATH, EXTRAC_PATH)
+        shutil.unpack_archive(ZIP_PATH, EXTRACTION_PATH)
         logger.info(f"📦 Book folder unzipped to: {EXTRACTION_PATH}")
 
     # Initialize LightRAG

@@ -1,5 +1,5 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 import json
 import logging
 import uvicorn
@@ -10,7 +10,7 @@ from datetime import datetime
 from dateutil.parser import parse
 import os
 import pytz
-
+import time
 from fastapi.middleware.cors import CORSMiddleware
 
 # ------------------------ Logging Configuration ------------------------
@@ -38,10 +38,112 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ------------------------ Prometheus Metrics Definitions ------------------------
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from functools import wraps
+
+# Define Prometheus metrics
+REQUEST_COUNT = Counter(
+    'api_requests_total',
+    'Total number of API requests received',
+    ['endpoint', 'method']
+)
+
+SUCCESS_COUNT = Counter(
+    'api_successful_responses_total',
+    'Total number of successful API responses',
+    ['endpoint']
+)
+
+FAILURE_COUNT = Counter(
+    'api_failed_responses_total',
+    'Total number of failed API responses',
+    ['endpoint']
+)
+
+REQUEST_LATENCY = Histogram(
+    'api_request_latency_seconds',
+    'Latency of API requests',
+    ['endpoint']
+)
+
+WEBSOCKET_CONNECTIONS = Gauge(
+    'websocket_connections',
+    'Number of active WebSocket connections'
+)
+
+WEBSOCKET_MESSAGES_RECEIVED = Counter(
+    'websocket_messages_received_total',
+    'Total number of messages received via WebSocket',
+    ['endpoint']
+)
+
+WEBSOCKET_MESSAGES_SENT = Counter(
+    'websocket_messages_sent_total',
+    'Total number of messages sent via WebSocket',
+    ['endpoint']
+)
+
+CSV_FILES_CREATED = Counter(
+    'csv_files_created_total',
+    'Total number of CSV files created'
+)
+
+CSV_ENTRIES_APPENDED = Counter(
+    'csv_entries_appended_total',
+    'Total number of entries appended to CSV files'
+)
+
+# ------------------------ Middleware for Metrics Collection -------------------------
+class MetricsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        endpoint = request.url.path
+        method = request.method
+        REQUEST_COUNT.labels(endpoint=endpoint, method=method).inc()
+        
+        start_time = time.time()
+        try:
+            response = await call_next(request)
+            if response.status_code < 400:
+                SUCCESS_COUNT.labels(endpoint=endpoint).inc()
+            else:
+                FAILURE_COUNT.labels(endpoint=endpoint).inc()
+            return response
+        except Exception as e:
+            FAILURE_COUNT.labels(endpoint=endpoint).inc()
+            raise e
+        finally:
+            latency = time.time() - start_time
+            REQUEST_LATENCY.labels(endpoint=endpoint).observe(latency)
+
+# Add the middleware to FastAPI app
+app.add_middleware(MetricsMiddleware)
+
+# ------------------------ Helper Functions for Prometheus Metrics -------------------------
+def websocket_connect():
+    WEBSOCKET_CONNECTIONS.inc()
+
+def websocket_disconnect():
+    WEBSOCKET_CONNECTIONS.dec()
+
+def websocket_message_received(endpoint: str):
+    WEBSOCKET_MESSAGES_RECEIVED.labels(endpoint=endpoint).inc()
+
+def websocket_message_sent(endpoint: str):
+    WEBSOCKET_MESSAGES_SENT.labels(endpoint=endpoint).inc()
+
+def csv_file_created():
+    CSV_FILES_CREATED.inc()
+
+def csv_entry_appended():
+    CSV_ENTRIES_APPENDED.inc()
+
 # ------------------------ HTTP Client Initialization ------------------------
 
 client = httpx.AsyncClient()
-api_url = "http://localhost:7000/generate_response_informed"
+api_url = "http://localhost:7000/generate_response_informed"  # Ensure this points to the API server's internal IP if on GCP
 rasp_pi_api_url = "https://humane-marmot-entirely.ngrok-free.app"
 headers = {"Content-Type": "application/json"}
 
@@ -59,8 +161,8 @@ CSV_HEADERS = [
 
 # ------------------------ In-Memory Conversation Histories ------------------------
 
-conversation_history = []      # Stores recent conversation states (up to last 3)
-full_conversation_history = [] # Stores all conversation states
+conversation_history = []       # Stores recent conversation states (up to last 3)
+full_conversation_history = []  # Stores all conversation states
 
 # Global variables
 csv_file_path = None
@@ -76,7 +178,10 @@ ET = pytz.timezone('US/Eastern')
 
 def generate_csv_filename():
     timestamp = datetime.now(ET).strftime("%Y%m%d_%H%M%S")
-    return os.path.join(session_csv_dir, f"conversation_history_{timestamp}.csv")
+    filename = f"conversation_history_{timestamp}.csv"
+    path = os.path.join(session_csv_dir, filename)
+    csv_file_created()
+    return path
 
 def initialize_csv_file(path):
     try:
@@ -93,6 +198,7 @@ def append_to_csv_file(path, entry_dict):
             writer = csv.DictWriter(file, fieldnames=CSV_HEADERS)
             writer.writerow(entry_dict)
         logger.info(f"Appended entry to CSV at {path}")
+        csv_entry_appended()
     except Exception as e:
         logger.error(f"Failed to append to CSV: {e}")
 
@@ -207,7 +313,6 @@ def format_responses_for_csv(responses_list):
 
 # ------------------------ WebSocket Endpoint ------------------------
 
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     global csv_file_path, conversation_history, full_conversation_history, time_responses_sent
@@ -221,13 +326,16 @@ async def websocket_endpoint(websocket: WebSocket):
     last_full_prompt_to_api = None
     initialize_csv_file(csv_file_path)
 
+    # Accept the WebSocket connection
     await websocket.accept()
     logger.info("WebSocket connection accepted.")
+    websocket_connect()
 
     try:
         while True:
             data = await websocket.receive_text()
             if data:
+                websocket_message_received("/ws")
                 time_received_osdpi = datetime.now(ET)
                 logger.info(f"Data received from OS-DPI at {time_received_osdpi}")
 
@@ -251,6 +359,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     if not partner_prompt:
                         logger.error("No prompt text received from RPi API.")
                         await websocket.send_text(json.dumps({'error': 'No prompt text received.'}))
+                        websocket_message_sent("/ws")
                         continue
 
                     # Parse timestamps from RPi API
@@ -272,6 +381,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     # Echo prompt back to UI
                     await websocket.send_text(json.dumps({'state': {"$Display": partner_prompt}}))
+                    websocket_message_sent("/ws")
 
                     # Add conversation history to the prompt for context
                     history_context = format_conversation_history_for_prompt(conversation_history)
@@ -295,7 +405,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     while len(responses_list) < 2:
                         responses_list.append({'response_text': 'No response available.'})
 
-                    # Hard-coded response keys again
+                    # Construct response dictionary
                     responses_dict = {
                         'Display': partner_prompt,
                         'response1': responses_list[0].get('response_text', ''),
@@ -307,6 +417,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     time_responses_sent = datetime.now(ET)
                     await websocket.send_text(json.dumps(responses_dict))
+                    websocket_message_sent("/ws")
 
                     # Update conversation histories with partner prompt and no chosen response yet
                     update_history(
@@ -337,6 +448,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             if not full_conversation_history:
                                 logger.error("Full conversation history is empty. Cannot append to CSV.")
                                 await websocket.send_text(json.dumps({'error': 'Conversation history is empty.'}))
+                                websocket_message_sent("/ws")
                                 continue
 
                             latest_full_entry = full_conversation_history[-1]
@@ -362,9 +474,11 @@ async def websocket_endpoint(websocket: WebSocket):
                         else:
                             logger.error("Chosen response received without a corresponding prompt.")
                             await websocket.send_text(json.dumps({'error': 'No corresponding prompt for chosen response.'}))
+                            websocket_message_sent("/ws")
                     else:
                         logger.error("No chosen response found in the received data.")
                         await websocket.send_text(json.dumps({'error': 'Chosen response is empty.'}))
+                        websocket_message_sent("/ws")
 
                 elif prefix == 'new_conv':
                     logger.info("Received 'new_conv' prefix, starting a new conversation.")
@@ -378,20 +492,24 @@ async def websocket_endpoint(websocket: WebSocket):
                     time_responses_sent = None
                     logger.info(f"New CSV file created at {csv_file_path} for the new conversation.")
                     await websocket.send_text(json.dumps({'state': {"$Info": "New conversation started."}}))
+                    websocket_message_sent("/ws")
 
                 else:
                     logger.error(f"Unexpected prefix value: {prefix}")
                     await websocket.send_text(json.dumps({'error': f"Unexpected prefix value: {prefix}"}))
+                    websocket_message_sent("/ws")
 
             except json.JSONDecodeError:
                 logger.error("Invalid JSON received.")
                 await websocket.send_text(json.dumps({'error': 'Invalid JSON format.'}))
+                websocket_message_sent("/ws")
             except Exception as e:
                 logger.error(f"An error occurred while processing the message: {e}")
                 await websocket.send_text(json.dumps({'error': 'Internal server error.'}))
+                websocket_message_sent("/ws")
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected.")
-
+        websocket_disconnect()
 
 # ------------------------ CSV Download Endpoint ------------------------
 
@@ -405,13 +523,17 @@ async def download_csv():
         logger.error("CSV file does not exist.")
         raise HTTPException(status_code=404, detail="CSV file does not exist.")
 
+# ------------------------ Metrics Endpoint ------------------------
+
+@app.get("/metrics")
+async def metrics_endpoint():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 # ------------------------ Root Endpoint ------------------------
 
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the Main Server. Use appropriate endpoints to interact."}
-
 
 # ------------------------ Graceful Shutdown ------------------------
 
@@ -420,9 +542,9 @@ async def shutdown_event():
     await client.aclose()
     logger.info("httpx client closed.")
 
-
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=5678, log_level="info")
+
 
 
 

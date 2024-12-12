@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from lightrag import LightRAG, QueryParam
@@ -12,6 +12,11 @@ from dotenv import load_dotenv
 import asyncio
 import json
 
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
+from functools import wraps
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -19,10 +24,69 @@ load_dotenv()
 logging.basicConfig(level=logging.DEBUG)  # Set to DEBUG for detailed logs
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="LightRAG API", version="1.2", description="API for Retrieval-Augmented Generation operations")
+app = FastAPI(
+    title="LightRAG API",
+    version="1.2",
+    description="API for Retrieval-Augmented Generation operations"
+)
 
-# ------------------------ Configuration ------------------------
+# -------------------------
+# Prometheus Metrics Definitions
+# -------------------------
+REQUEST_COUNT = Counter(
+    'api_requests_total',
+    'Total number of API requests received',
+    ['endpoint', 'method']
+)
 
+SUCCESS_COUNT = Counter(
+    'api_successful_responses_total',
+    'Total number of successful API responses',
+    ['endpoint']
+)
+
+FAILURE_COUNT = Counter(
+    'api_failed_responses_total',
+    'Total number of failed API responses',
+    ['endpoint']
+)
+
+REQUEST_LATENCY = Histogram(
+    'api_request_latency_seconds',
+    'Latency of API requests',
+    ['endpoint']
+)
+
+# -------------------------
+# Middleware for Metrics Collection
+# -------------------------
+class MetricsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        endpoint = request.url.path
+        method = request.method
+        REQUEST_COUNT.labels(endpoint=endpoint, method=method).inc()
+        
+        start_time = time.time()
+        try:
+            response = await call_next(request)
+            if response.status_code < 400:
+                SUCCESS_COUNT.labels(endpoint=endpoint).inc()
+            else:
+                FAILURE_COUNT.labels(endpoint=endpoint).inc()
+            return response
+        except Exception as e:
+            FAILURE_COUNT.labels(endpoint=endpoint).inc()
+            raise e
+        finally:
+            latency = time.time() - start_time
+            REQUEST_LATENCY.labels(endpoint=endpoint).observe(latency)
+
+# Add the middleware to FastAPI app
+app.add_middleware(MetricsMiddleware)
+
+# -------------------------
+# Configuration Constants
+# -------------------------
 # Ensure the environment variable for OpenAI is set
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
@@ -36,8 +100,9 @@ os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 ZIP_PATH = "book_backup.zip"
 EXTRACTION_PATH = "book_data/"
 
-# ------------------------ Initialize LightRAG ------------------------
-
+# -------------------------
+# Initialize LightRAG
+# -------------------------
 # Global variable for LightRAG instance
 rag: Optional[LightRAG] = None
 
@@ -63,8 +128,9 @@ async def initialize_lightrag():
 async def startup_event():
     await initialize_lightrag()
 
-# ------------------------ Helper Functions ------------------------
-
+# -------------------------
+# Helper Functions
+# -------------------------
 # Define a helper async function to query LightRAG
 async def aquery(query: str, param: QueryParam):
     loop = asyncio.get_running_loop()
@@ -72,8 +138,9 @@ async def aquery(query: str, param: QueryParam):
     response = await loop.run_in_executor(None, rag.query, query, param)
     return response
 
-# ------------------------ Request and Response Models ------------------------
-
+# -------------------------
+# Request and Response Models
+# -------------------------
 class GenerateResponseRequest(BaseModel):
     prompt: str = Field(..., example="What are the benefits of renewable energy?")
     number_of_responses: int = Field(..., ge=1, le=5, example=2)
@@ -89,9 +156,27 @@ class GenerateResponseResponse(BaseModel):
     responses: List[GeneratedResponse]
     total_latency_seconds: float
 
-# ------------------------ API Endpoints ------------------------
+# -------------------------
+# Decorator for Measuring Latency (Optional)
+# -------------------------
+def measure_latency(endpoint_name):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            start_time = time.time()
+            try:
+                return await func(*args, **kwargs)
+            finally:
+                latency = time.time() - start_time
+                REQUEST_LATENCY.labels(endpoint=endpoint_name).observe(latency)
+        return wrapper
+    return decorator
 
+# -------------------------
+# API Endpoints
+# -------------------------
 @app.post("/generate_response_informed", response_model=GenerateResponseResponse)
+# @measure_latency(endpoint_name="/generate_response_informed")  # Optional detailed latency measurement
 async def generate_response_informed(request: GenerateResponseRequest):
     if not request.prompt.strip():
         logger.warning("Empty prompt received.")
@@ -104,10 +189,12 @@ async def generate_response_informed(request: GenerateResponseRequest):
             detail="The number of response types must match the number of responses requested."
         )
 
-    logger.info(f"Received request with prompt: {request.prompt[:50]}..., "
-                f"number_of_responses: {request.number_of_responses}, "
-                f"response_types: {request.response_types}, "
-                f"search_mode: {request.search_mode}")
+    logger.info(
+        f"Received request with prompt: {request.prompt[:50]}..., "
+        f"number_of_responses: {request.number_of_responses}, "
+        f"response_types: {request.response_types}, "
+        f"search_mode: {request.search_mode}"
+    )
 
     # Define the system prompt with JSON instruction and example
     system_prompt = (
@@ -197,17 +284,25 @@ async def generate_response_informed(request: GenerateResponseRequest):
         logger.error(f"Error generating response: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error.")
 
-# ------------------------ Root Endpoint ------------------------
-
+# -------------------------
+# Root Endpoint
+# -------------------------
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the LightRAG API. Use /generate_response_informed to generate responses."}
 
-# ------------------------ Run the API ------------------------
+# -------------------------
+# Metrics Endpoint
+# -------------------------
+@app.get("/metrics")
+async def metrics_endpoint():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
+# -------------------------
+# Run the API
+# -------------------------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=7000)
-
 
 
 

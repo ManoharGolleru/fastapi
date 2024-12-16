@@ -9,4 +9,4 @@ pandas==2.0.3
 lightrag-hku==0.0.7
 transformers
 nest_asyncio
-edhsibcis
+
